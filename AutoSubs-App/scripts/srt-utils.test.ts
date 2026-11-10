@@ -1,0 +1,220 @@
+import assert from "node:assert/strict";
+import { parseSrt, generateSrt } from "../src/utils/srt-utils.ts";
+import {
+  buildSubtitleExportContent,
+  subtitleExportDialogOptions,
+} from "../src/utils/export-file.ts";
+import { speakerCueColor } from "../src/utils/speaker-label.ts";
+import { subtitleToBackendSegment } from "../src/api/formatting-api.ts";
+import type { Speaker, Subtitle } from "../src/types.ts";
+
+const lfSrt = `1
+00:00:00,000 --> 00:00:02,000
+Hello
+
+2
+00:00:03,000 --> 00:00:05,000
+This is a test.
+`;
+
+const crlfTwoLineSrt = [
+  "1",
+  "00:00:00,000 --> 00:00:02,000",
+  "Hello",
+  "world",
+  "",
+  "2",
+  "00:00:03,000 --> 00:00:05,000",
+  "Second cue",
+  "",
+].join("\r\n");
+
+const lfCues = parseSrt(lfSrt);
+assert.equal(lfCues.length, 2, "LF SRT should parse two cues");
+assert.equal(lfCues[0].text, "Hello");
+assert.equal(lfCues[1].text, "This is a test.");
+assert.equal(lfCues[0].start, 0);
+assert.equal(lfCues[1].start, 3);
+
+const crlfCues = parseSrt(crlfTwoLineSrt);
+assert.equal(crlfCues.length, 2, "CRLF SRT should parse two cues");
+assert.equal(crlfCues[0].text, "Hello\nworld", "in-cue line breaks should be preserved");
+assert.equal(crlfCues[1].text, "Second cue");
+
+const bomCues = parseSrt(`\uFEFF${lfSrt}`);
+assert.equal(bomCues.length, 2, "UTF-8 BOM should not break parsing");
+
+const roundTrip = parseSrt(generateSrt([
+  { id: 0, start: 0, end: 2, text: "Hello\nworld", words: [] },
+  { id: 1, start: 3, end: 5, text: "Second cue", words: [] },
+]));
+assert.equal(roundTrip.length, 2);
+assert.equal(roundTrip[0].text, "Hello\nworld");
+
+// Documents imported before the timing fix contain string-valued word times.
+// Reformat must convert them before Tauri serializes the Rust command payload.
+const legacySubtitle = {
+  id: 0,
+  start: 0,
+  end: 2,
+  text: "Hello\nworld",
+  words: [
+    { word: "Hello", start: "0.000", end: "1.000", line_number: 0 },
+    { word: "\nworld", start: "1.000", end: "2.000", line_number: 1 },
+  ],
+} as unknown as Subtitle;
+const backendSegment = subtitleToBackendSegment(legacySubtitle);
+assert.deepEqual(backendSegment.words?.map(({ start, end }) => [start, end]), [
+  [0, 1],
+  [1, 2],
+]);
+assert.equal(backendSegment.text, "Hello\nworld");
+
+const speaker = (name: string): Speaker => ({
+  name,
+  style: "None",
+  color: "#ffffff",
+  sample: { start: 0, end: 1 },
+});
+
+const spoken: Subtitle[] = [
+  { id: 0, start: 0, end: 2, text: "Hello\nworld", words: [], speaker_id: "1" },
+  { id: 1, start: 3, end: 5, text: "Second cue", words: [], speaker_id: "2" },
+];
+
+const plainSrt = generateSrt(spoken, {
+  speakers: [speaker("Alex"), speaker("Blair")],
+});
+assert.equal(plainSrt.includes("Alex"), false, "plain SRT stays unlabeled");
+assert.equal(plainSrt.includes("Speaker"), false);
+assert.match(plainSrt, /Hello\nworld/);
+
+const namedSrt = generateSrt(spoken, {
+  includeSpeakerLabels: true,
+  speakers: [speaker("Alex"), speaker("Blair")],
+});
+assert.match(namedSrt, /Alex: Hello\nworld/);
+assert.match(namedSrt, /Blair: Second cue/);
+assert.equal(namedSrt.includes("[Alex]"), false);
+
+const fallbackSrt = generateSrt(spoken, { includeSpeakerLabels: true });
+assert.match(fallbackSrt, /Speaker 1: Hello\nworld/);
+assert.match(fallbackSrt, /Speaker 2: Second cue/);
+
+const blankNameSrt = generateSrt(
+  [{ id: 0, start: 0, end: 1, text: "Hi", words: [], speaker_id: "1" }],
+  { includeSpeakerLabels: true, speakers: [speaker("  ")] },
+);
+assert.match(blankNameSrt, /Speaker 1: Hi/);
+
+const zeroBasedSrt = generateSrt(
+  [
+    { id: 0, start: 0, end: 1, text: "A", words: [], speaker_id: "0" },
+    { id: 1, start: 2, end: 3, text: "B", words: [], speaker_id: "1" },
+  ],
+  { includeSpeakerLabels: true, speakers: [speaker("Alex"), speaker("Blair")] },
+);
+assert.match(zeroBasedSrt, /Alex: A/);
+assert.match(zeroBasedSrt, /Blair: B/);
+
+const unlabeledSrt = generateSrt(
+  [
+    { id: 0, start: 0, end: 1, text: "Hi", words: [], speaker_id: "?" },
+    { id: 1, start: 2, end: 3, text: "There", words: [], speaker_id: "  " },
+    { id: 2, start: 4, end: 5, text: "Host", words: [], speaker_id: "host" },
+  ],
+  { includeSpeakerLabels: true, speakers: [speaker("Alex")] },
+);
+assert.match(unlabeledSrt, /Hi/);
+assert.equal(unlabeledSrt.includes("Alex"), false);
+assert.equal(unlabeledSrt.includes("Speaker ?"), false);
+assert.match(unlabeledSrt, /Speaker host: Host/);
+
+const paddedIdSrt = generateSrt(
+  [{ id: 0, start: 0, end: 1, text: "Hi", words: [], speaker_id: " 1 " }],
+  { includeSpeakerLabels: true, speakers: [speaker("Alex")] },
+);
+assert.match(paddedIdSrt, /Alex: Hi/);
+
+// An empty cue for speaker 0 must not stop the transcript from being detected
+// as zero-based: speaker 1 is Blair, not whatever sits at index 0.
+const emptyCueSrt = generateSrt(
+  [
+    { id: 0, start: 0, end: 1, text: "  ", words: [], speaker_id: "0" },
+    { id: 1, start: 2, end: 3, text: "Hi", words: [], speaker_id: "1" },
+  ],
+  { includeSpeakerLabels: true, speakers: [speaker("Alex"), speaker("Blair")] },
+);
+assert.match(emptyCueSrt, /Blair: Hi/);
+assert.equal(emptyCueSrt.includes("Alex"), false);
+assert.equal(emptyCueSrt.includes("Speaker 0"), false);
+
+// A renamed speaker with embedded line breaks must not inject extra cues into
+// the exported file: whitespace collapses to a single-line label.
+const multilineNameSrt = generateSrt(
+  [{ id: 0, start: 0, end: 1, text: "Hi", words: [], speaker_id: "1" }],
+  { includeSpeakerLabels: true, speakers: [speaker("Host\n\nDJ")] },
+);
+assert.match(multilineNameSrt, /Host DJ: Hi/);
+const multilineCues = parseSrt(multilineNameSrt);
+assert.equal(multilineCues.length, 1, "label line breaks must not split the cue");
+assert.equal(multilineCues[0].text, "Host DJ: Hi");
+
+// The export menu's "SRT with speakers" entry must reach the provider as a
+// labeled .srt, while plain "Subtitles (.srt)" stays unlabeled.
+const speakerOptions = subtitleExportDialogOptions("srt-speakers", "clip");
+assert.equal(speakerOptions.defaultPath, "clip.srt");
+assert.deepEqual(speakerOptions.filters, [
+  { name: "SRT Files", extensions: ["srt"] },
+]);
+const speakerContent = buildSubtitleExportContent(
+  "srt-speakers",
+  spoken,
+  [speaker("Alex"), speaker("Blair")],
+);
+assert.match(speakerContent, /Alex: Hello\nworld/);
+assert.match(speakerContent, /Blair: Second cue/);
+
+const plainOptions = subtitleExportDialogOptions("srt", "clip");
+assert.equal(plainOptions.defaultPath, "clip.srt");
+const plainContent = buildSubtitleExportContent(
+  "srt",
+  spoken,
+  [speaker("Alex"), speaker("Blair")],
+);
+assert.equal(plainContent.includes("Alex"), false);
+
+// "SRT speaker colours" wraps each whole cue in its speaker's colour, which
+// Resolve imports as per-subtitle styling. Speakers styled "None" stay plain.
+assert.equal(subtitleExportDialogOptions("srt-colors", "clip").defaultPath, "clip.srt");
+const colorContent = buildSubtitleExportContent("srt-colors", spoken, [
+  { ...speaker("Alex"), style: "Fill", color: "#ff0000" },
+  speaker("Blair"),
+]);
+assert.match(colorContent, /<font color="#FF0000">Hello\nworld<\/font>/);
+assert.match(colorContent, /\nSecond cue\n/);
+assert.equal(colorContent.includes("Alex"), false, "colour export adds no labels");
+assert.equal(plainContent.includes("<font"), false, "plain SRT stays uncoloured");
+
+// A blank or "?" speaker is unknown, even in a zero-based transcript where
+// Number("") would otherwise pick speaker 0.
+const red = [{ ...speaker("Alex"), style: "Fill", color: "#ff0000" }] as Speaker[];
+assert.equal(speakerCueColor("0", red, 0), "#FF0000");
+assert.equal(speakerCueColor("", red, 0), null);
+assert.equal(speakerCueColor("  ", red, 0), null);
+assert.equal(speakerCueColor("?", red, 0), null);
+assert.equal(speakerCueColor(undefined, red, 0), null);
+
+const txtOptions = subtitleExportDialogOptions("txt", "clip");
+assert.equal(txtOptions.defaultPath, "clip.txt");
+assert.deepEqual(txtOptions.filters, [
+  { name: "Text Files", extensions: ["txt"] },
+]);
+const txtContent = buildSubtitleExportContent(
+  "txt",
+  spoken,
+  [speaker("Alex"), speaker("Blair")],
+);
+assert.match(txtContent, /Alex:\nHello world/);
+
+console.log("srt-utils tests passed");
